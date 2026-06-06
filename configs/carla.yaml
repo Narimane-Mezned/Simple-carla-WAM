@@ -1,0 +1,22 @@
+carla:
+  dataset_root: "./dataset"
+  manifest_path: "./dataset/manifest.jsonl"
+  render_size: [64, 64]
+  image_size: 64
+  num_actions: 3
+  steps: 100000
+  replay_size: 50000
+  batch_size: 16
+  batch_length: 16
+  dyn_hidden: 512
+  dyn_stoch: 32
+  dyn_discrete: 32
+  cnn_depth: 32
+  reward_head: "twohot_symlog"
+  model_lr: 1e-4
+  actor_lr: 3e-5
+  critic_lr: 3e-5
+  log_every: 1000
+  video_every: 5000
+  device: "cuda"
+  precision: 16
