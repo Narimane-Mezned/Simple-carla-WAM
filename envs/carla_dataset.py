@@ -1,8 +1,4 @@
 """
-envs/carla_dataset.py
----------------------
-CARLA offline dataset presented as a gym-like environment for DreamerV3.
-
 CONFIRMED dataset structure (from manifest.jsonl):
   Each line contains:
     episode_index, source_run, frame_index, image_path,
