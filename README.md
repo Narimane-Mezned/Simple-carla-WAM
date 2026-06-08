@@ -1,67 +1,135 @@
-# dreamerv3-torch
+# Simple CARLA World Action Model (WAM)
 
-> [!IMPORTANT]
-> **Notice: Outdated Implementation**
-> 
-> This codebase was implemented prior to major updates to DreamerV3 and does not reflect those changes, which accounts for several GitHub Issues in this repository.
-> 
-> An up-to-date and **~5x faster** PyTorch DreamerV3 reproduction is now maintained as part of our new repository: **[r2dreamer](https://github.com/NM512/r2dreamer)**. Please refer to that repository for the latest DreamerV3 baseline, provided alongside a PyTorch implementation of R2-Dreamer (ICLR 2026).
+A DreamerV3-style World Action Model implemented from scratch in PyTorch, trained on offline CARLA front-camera driving data.
 
-Pytorch implementation of [Mastering Diverse Domains through World Models](https://arxiv.org/abs/2301.04104v1). DreamerV3 is a scalable algorithm that outperforms previous approaches across various domains with fixed hyperparameters.
+---
 
-## Instructions
+## What it does
 
-### Method 1: Manual
+Given a sequence of past driving frames, the model:
+- **Compresses** each frame into a compact latent representation
+- **Models** how the world evolves over time given driving actions
+- **Dreams** future frames without seeing real images
+- **Predicts** future driving actions (steering, throttle, brake)
 
-Get dependencies with python 3.11:
+---
+
+## Architecture
+
+| Component | Type | Role |
+|---|---|---|
+| ConvEncoder | 4-layer CNN + SiLU | Image (64×64×3) → latent vector (256-dim) |
+| RSSM | GRU (512) + prior/posterior | Temporal dynamics + dreaming |
+| ConvDecoder | 4-layer transposed CNN | Latent vector → reconstructed image |
+| ActionHead | 3-layer MLP + Tanh | World state → [steering, throttle, brake] |
+
+**Total parameters: 8.2M**
+
+---
+
+## Dataset
+
+The model trains on the CARLA driving dataset :
+- 133,672 sequential front-camera frames
+- 209 driving episodes
+- Each frame linked to: steering, throttle, brake, speed_ratio, red_light, instruction
+
+The dataset is not included in this repository. 
+
+---
+
+## Project Structure
+
 ```
-pip install -r requirements.txt
+Simple-carla-WAM/
+├── envs/
+│   └── carla_dataset.py     — dataset loader (manifest.jsonl → sequences)
+├── train_carla.py           — full WAM training script
+├── evaluate_carla.py        — dreaming evaluation → generates dream.gif
+├── cosmos_transfer.py       — converts CARLA frames to photorealistic (SDU server)
+├── test_setup.py            — sanity checks before training
+└── configs/
+    └── carla.yaml           — hyperparameters
 ```
-Run training on DMC Vision:
+
+---
+
+## Installation
+
+```bash
+# Python 3.12 required (3.13+ not supported by PyTorch CUDA builds)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install numpy pillow pandas
 ```
-python3 dreamer.py --configs dmc_vision --task dmc_walker_walk --logdir ./logdir/dmc_walker_walk
+
+---
+
+## Usage
+
+### Step 1 — Verify setup
+```bash
+python test_setup.py \
+    --dataset_root /path/to/dataset \
+    --manifest_path /path/to/dataset/manifest.jsonl
 ```
-Monitor results:
+
+### Step 2 — Train
+```bash
+python train_carla.py \
+    --dataset_root /path/to/dataset \
+    --manifest_path /path/to/dataset/manifest.jsonl \
+    --steps 500000 \
+    --image_size 96 \
+    --device cuda \
+    --logdir ./logdir/carla_sdu
 ```
-tensorboard --logdir ./logdir
+
+### Step 3 — Generate dreaming GIF
+```bash
+python evaluate_carla.py \
+    --checkpoint ./logdir/carla_sdu/checkpoint_final.pt \
+    --dataset_root /path/to/dataset \
+    --manifest_path /path/to/dataset/manifest.jsonl \
+    --output ./outputs/dream_final.gif \
+    --device cuda
 ```
-To set up Atari or Minecraft environments, please check the scripts located in [env/setup_scripts](https://github.com/NM512/dreamerv3-torch/tree/main/envs/setup_scripts).
 
-### Method 2: Docker
+### Step 4 — (Optional) Apply Cosmos Transfer before training
+```bash
+python cosmos_transfer.py \
+    --input_root  /path/to/dataset \
+    --output_root /path/to/dataset_cosmos \
+    --manifest_path /path/to/dataset/manifest.jsonl \
+    --device cuda
+```
+Then point `--dataset_root` to the Cosmos output folder in Step 2.
 
-Please refer to the Dockerfile for the instructions, as they are included within.
+---
 
-## Benchmarks
-So far, the following benchmarks can be used for testing.
-| Environment        | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [DMC Proprio](https://github.com/deepmind/dm_control) | State | Continuous | 500K | DeepMind Control Suite with low-dimensional inputs. |
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous |1M| DeepMind Control Suite with high-dimensional images inputs. |
-| [Atari 100k](https://github.com/openai/atari-py) | Image | Discrete |400K| 26 Atari games. |
-| [Crafter](https://github.com/danijar/crafter) | Image | Discrete |1M| Survival environment to evaluates diverse agent abilities.|
-| [Minecraft](https://github.com/minerllabs/minerl) | Image and State |Discrete |100M| Vast 3D open world.|
-| [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
+## Training Results (proof of concept — 50,000 steps, RTX 2050)
 
-## Results
-#### DMC Proprio
-![dmcproprio](imgs/dmcproprio.png)
-#### DMC Vision
-![dmcvision](imgs/dmcvision.png)
-#### Atari 100k
-![atari100k](imgs/atari100k.png)
+| Step | Loss | Recon | Action |
+|---|---|---|---|
+| 500 | 1.054 | 0.036 | 0.0185 |
+| 10,000 | 1.012 | 0.010 | 0.0024 |
+| 50,000 | 1.007 | 0.005 | 0.0017 |
 
-#### Crafter
-<img src="https://github.com/NM512/dreamerv3-torch/assets/70328564/a0626038-53f6-4300-a622-7ac257f4c290" width="300" height="150" />
+- Reconstruction loss: ↓ 86%
+- Action prediction loss: ↓ 91%
+- Training time: 236 minutes on RTX 2050
 
-### Troubleshooting
 
-**`AttributeError: 'NoneType' object has no attribute 'glGetError'`**
-If you encounter this OpenGL-related error when running DMCtasks, it is typically caused by a headless rendering environment setup. Please refer to [this discussion/issue](https://github.com/NM512/dreamerv3-torch/issues/65) for the solution.
+---
 
-## Acknowledgments
-This code is heavily inspired by the following works:
-- danijar's Dreamer-v3 jax implementation: https://github.com/danijar/dreamerv3
-- danijar's Dreamer-v2 tensorflow implementation: https://github.com/danijar/dreamerv2
-- jsikyoon's Dreamer-v2 pytorch implementation: https://github.com/jsikyoon/dreamer-torch
-- RajGhugare19's Dreamer-v2 pytorch implementation: https://github.com/RajGhugare19/dreamerv2
-- denisyarats's DrQ-v2 original implementation: https://github.com/facebookresearch/drqv2
+## Recommended hyperparameters for full run 
+
+| Parameter | Value |
+|---|---|
+| Steps | 500,000 |
+| Image size | 96×96 |
+| Batch size | 16 |
+| Sequence length | 16 |
+| Latent dim | 256 |
+| Deter dim | 512 |
+| Device | CUDA (A100 / H100) |
+
