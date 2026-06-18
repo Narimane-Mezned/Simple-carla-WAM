@@ -238,8 +238,8 @@ class WorldModel(nn.Module):
         imagined_states = self.rssm.imagine(h, z, last_action, dream_steps)
         imagined_states = imagined_states.permute(1, 0, 2)
         imagined_imgs   = self.decoder(imagined_states)
-        return imagined_imgs
-
+        pred_actions    = self.action_head(imagined_states)
+        return imagined_imgs, pred_actions
 
 def kl_loss(posts, priors):
     post_mu,  post_ls  = posts.chunk(2,  dim=-1)
