@@ -208,9 +208,9 @@ def main():
     print(f"Output dataset         : {args.output_root}")
     print(f"\nNow train the WAM on enhanced data:")
     print(f"  python train_carla.py \\")
-    print(f"    dataset_root {args.output_root} \\")
-    print(f"    manifest_path {out_manifest} \\")
-    print(f"    steps 500000 - device cuda")
+    print(f"    --dataset_root {args.output_root} \\")
+    print(f"    --manifest_path {out_manifest} \\")
+    print(f"    --steps 500000 --device cuda")
    
 
 if __name__ == "__main__":
