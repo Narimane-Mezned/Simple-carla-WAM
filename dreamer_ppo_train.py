@@ -2,35 +2,48 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Normal
+from collections import defaultdict
 import sys
 sys.path.insert(0, r'C:\Users\nerim\OneDrive\Bureau\Carla-world-model\world-model')
 from envs.carla_offline_cot_env import CarlaOfflineCotEnv
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+ACTION_LOW  = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+ACTION_HIGH = np.array([ 1.0, 1.0, 1.0], dtype=np.float32)
+
+
 class RolloutBuffer:
     def __init__(self, size, state_dim, action_dim, gamma=0.99, gae_lambda=0.95):
         self.size       = size
         self.gamma      = gamma
         self.gae_lambda = gae_lambda
-        self.states     = np.zeros((size, state_dim),  dtype=np.float32)
-        self.actions    = np.zeros((size, action_dim), dtype=np.float32)
-        self.rewards    = np.zeros(size, dtype=np.float32)
-        self.dones      = np.zeros(size, dtype=np.float32)
-        self.values     = np.zeros(size, dtype=np.float32)
-        self.log_probs  = np.zeros(size, dtype=np.float32)
-        self.advantages = np.zeros(size, dtype=np.float32)
-        self.returns    = np.zeros(size, dtype=np.float32)
-        self.ptr        = 0
+        self.states      = np.zeros((size, state_dim),  dtype=np.float32)
+        self.next_states = np.zeros((size, state_dim),  dtype=np.float32)
+        self.actions     = np.zeros((size, action_dim), dtype=np.float32)
+        self.rewards     = np.zeros(size, dtype=np.float32)
+        self.dones       = np.zeros(size, dtype=np.float32)
+        self.values      = np.zeros(size, dtype=np.float32)
+        self.log_probs   = np.zeros(size, dtype=np.float32)
+        self.advantages  = np.zeros(size, dtype=np.float32)
+        self.returns     = np.zeros(size, dtype=np.float32)
+        self.vru_risks   = np.zeros(size, dtype=np.float32)
+        self.progresses  = np.zeros(size, dtype=np.float32)
+        self.scenarios   = []
+        self.ptr = 0
         self.path_start_idx = 0
 
-    def store(self, state, action, reward, done, value, log_prob):
-        self.states[self.ptr]    = state
-        self.actions[self.ptr]   = action
-        self.rewards[self.ptr]   = reward
-        self.dones[self.ptr]     = done
-        self.values[self.ptr]    = value
-        self.log_probs[self.ptr] = log_prob
+    def store(self, state, next_state, action, reward, done, value, log_prob, vru_risk, progress, scenario):
+        self.states[self.ptr]      = state
+        self.next_states[self.ptr] = next_state
+        self.actions[self.ptr]     = action
+        self.rewards[self.ptr]     = reward
+        self.dones[self.ptr]       = done
+        self.values[self.ptr]      = value
+        self.log_probs[self.ptr]   = log_prob
+        self.vru_risks[self.ptr]   = vru_risk
+        self.progresses[self.ptr]  = progress
+        self.scenarios.append(scenario)
         self.ptr += 1
 
     def finish_path(self, last_value=0.0):
@@ -50,19 +63,23 @@ class RolloutBuffer:
     def clear(self):
         self.ptr = 0
         self.path_start_idx = 0
+        self.scenarios = []
 
     def get(self):
         adv = self.advantages[:self.ptr]
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         return dict(
-            states     = torch.tensor(self.states[:self.ptr],    device=device),
-            actions    = torch.tensor(self.actions[:self.ptr],   device=device),
-            rewards    = torch.tensor(self.rewards[:self.ptr],   device=device),
-            dones      = torch.tensor(self.dones[:self.ptr],     device=device),
-            values     = torch.tensor(self.values[:self.ptr],    device=device),
-            log_probs  = torch.tensor(self.log_probs[:self.ptr], device=device),
-            advantages = torch.tensor(adv,                       device=device),
-            returns    = torch.tensor(self.returns[:self.ptr],   device=device),
+            states      = torch.tensor(self.states[:self.ptr],      device=device),
+            next_states = torch.tensor(self.next_states[:self.ptr], device=device),
+            actions     = torch.tensor(self.actions[:self.ptr],     device=device),
+            rewards     = torch.tensor(self.rewards[:self.ptr],     device=device),
+            dones       = torch.tensor(self.dones[:self.ptr],       device=device),
+            values      = torch.tensor(self.values[:self.ptr],      device=device),
+            log_probs   = torch.tensor(self.log_probs[:self.ptr],   device=device),
+            advantages  = torch.tensor(adv,                         device=device),
+            returns     = torch.tensor(self.returns[:self.ptr],     device=device),
+            vru_risks   = torch.tensor(self.vru_risks[:self.ptr],   device=device),
+            progresses  = torch.tensor(self.progresses[:self.ptr],  device=device),
         )
 
 
@@ -78,9 +95,10 @@ class ActorCritic(torch.nn.Module):
         self.critic        = torch.nn.Linear(hidden_dim, 1)
 
     def forward(self, s):
-        z     = self.shared(s)
-        mean  = self.actor_mean(z)
-        std   = self.actor_log_std.exp().expand_as(mean)
+        z = self.shared(s)
+        mean = self.actor_mean(z)
+        log_std = self.actor_log_std.clamp(-3.0, 1.0)
+        std = log_std.exp().expand_as(mean)
         value = self.critic(z).squeeze(-1)
         return mean, std, value
 
@@ -124,14 +142,20 @@ def select_action_with_dreaming(policy, world_model, state, k=5):
     candidates = []
     for _ in range(k):
         action, logp, value = policy.act(state)
-        _, risk_hat, progress_hat = world_model(state, action)
+        action_clipped = torch.clamp(
+            action,
+            torch.tensor(ACTION_LOW, device=device),
+            torch.tensor(ACTION_HIGH, device=device)
+        )
+        _, risk_hat, progress_hat = world_model(state, action_clipped)
         score = progress_hat - 2.0 * risk_hat + 0.5 * value
-        candidates.append((score.item(), action, logp, value))
+        candidates.append((score.item(), action_clipped, logp, value))
     best = max(candidates, key=lambda x: x[0])
     return best[1], best[2], best[3]
 
 
-def train(num_episodes=50, rollout_size=512):
+def train(num_episodes=1000, rollout_size=512):
+
     env        = CarlaOfflineCotEnv(max_ep_len=64)
     state_dim  = env.state_dim
     action_dim = env.action_dim
@@ -142,16 +166,31 @@ def train(num_episodes=50, rollout_size=512):
     opt_wm      = torch.optim.Adam(world_model.parameters(), lr=3e-4)
     buffer      = RolloutBuffer(rollout_size, state_dim, action_dim)
 
+    best_reward  = -np.inf
+    history      = []
+
     for episode in range(num_episodes):
         obs = env.reset()
         buffer.clear()
+        ep_rewards   = []
+        scenario_rewards = defaultdict(list)
 
         while buffer.ptr < rollout_size:
             state  = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             action, logp, value = select_action_with_dreaming(policy, world_model, state)
-            action_np  = action.squeeze(0).cpu().numpy()
+            action_np = np.clip(action.squeeze(0).cpu().numpy(), ACTION_LOW, ACTION_HIGH)
+
             next_obs, reward, done, info = env.step(action_np)
-            buffer.store(obs, action_np, reward, float(done), value.item(), logp.item())
+
+            buffer.store(
+                obs, next_obs, action_np, reward, float(done),
+                value.item(), logp.item(),
+                info["vru_risk"], info["progress"], info["scenario"]
+            )
+
+            ep_rewards.append(reward)
+            scenario_rewards[info["scenario"]].append(reward)
+
             obs = next_obs
             if done:
                 buffer.finish_path(last_value=0.0)
@@ -159,7 +198,7 @@ def train(num_episodes=50, rollout_size=512):
 
         if buffer.ptr > 0 and buffer.ptr == rollout_size:
             with torch.no_grad():
-                ns     = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                ns = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 _, _, last_value = policy.forward(ns)
             buffer.finish_path(last_value=last_value.item())
 
@@ -177,18 +216,39 @@ def train(num_episodes=50, rollout_size=512):
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
             opt_pi.step()
 
+        for _ in range(10):
             s_next_hat, risk_hat, progress_hat = world_model(batch["states"], batch["actions"])
-            loss_wm = F.mse_loss(s_next_hat, batch["states"])
+            loss_next     = F.mse_loss(s_next_hat, batch["next_states"])
+            loss_risk     = F.mse_loss(risk_hat,     batch["vru_risks"])
+            loss_progress = F.mse_loss(progress_hat, batch["progresses"])
+            loss_wm       = loss_next + 0.5 * loss_risk + 0.5 * loss_progress
             opt_wm.zero_grad()
             loss_wm.backward()
             torch.nn.utils.clip_grad_norm_(world_model.parameters(), 0.5)
             opt_wm.step()
 
-        print(f"Episode {episode+1:03d} | PPO loss: {loss.item():.4f} | WM loss: {loss_wm.item():.4f}")
+        mean_reward = np.mean(ep_rewards)
+        history.append(mean_reward)
+
+        scenario_log = " | ".join(
+            f"{k}: {np.mean(v):.2f}" for k, v in sorted(scenario_rewards.items())
+        )
+        print(
+            f"Ep {episode+1:03d} | "
+            f"PPO: {loss.item():.4f} | "
+            f"WM: {loss_wm.item():.4f} | "
+            f"Reward: {mean_reward:.3f} | "
+            f"[{scenario_log}]"
+        )
+
+        if mean_reward > best_reward:
+            best_reward = mean_reward
+            torch.save(policy.state_dict(),      "outputs/dreamer_ppo_policy_best.pt")
+            torch.save(world_model.state_dict(), "outputs/dreamer_ppo_worldmodel_best.pt")
 
     torch.save(policy.state_dict(),      "outputs/dreamer_ppo_policy.pt")
     torch.save(world_model.state_dict(), "outputs/dreamer_ppo_worldmodel.pt")
-    print("Training complete. Checkpoints saved to outputs/")
+    print(f"Training complete. Best reward: {best_reward:.3f}")
 
 
 if __name__ == "__main__":

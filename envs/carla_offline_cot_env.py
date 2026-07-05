@@ -1,7 +1,7 @@
 import json
 import os
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 from sentence_transformers import SentenceTransformer
 
 DATASET_ROOT = r"C:\Users\nerim\OneDrive\Bureau\Carla-world-model\maram_groot_carla_frames 1\maram_groot_carla_frames"
@@ -12,6 +12,18 @@ W_BRAKE     = -0.5
 W_RED_LIGHT = -2.0
 W_SMOOTH    = -0.1
 
+SCENARIO_BONUS = {
+    "near_stop":   2.0,
+    "traffic_jam": 1.5,
+    "red_light":   0.5,
+    "hard_brake":  2.5,
+}
+
+
+ACTION_LOW  = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+ACTION_HIGH = np.array([ 1.0, 1.0, 1.0], dtype=np.float32)
+
+
 class CarlaOfflineCotEnv:
     def __init__(self, max_ep_len=64):
         self.max_ep_len = max_ep_len
@@ -19,12 +31,16 @@ class CarlaOfflineCotEnv:
         self._episodes = self._load_episodes()
         self._ep_keys  = list(self._episodes.keys())
         print(f"[CarlaOfflineCotEnv] {len(self._ep_keys)} episodes loaded")
+
+        self._ep_weights = self._compute_episode_weights()
+
         print("[CarlaOfflineCotEnv] Loading CoT encoder...")
         self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self._encoder.eval()
         for p in self._encoder.parameters():
             p.requires_grad_(False)
         print("[CarlaOfflineCotEnv] Encoder ready.")
+
         self._cot_cache     = {}
         self._current_ep    = []
         self._frame_idx     = 0
@@ -33,8 +49,30 @@ class CarlaOfflineCotEnv:
         self.state_dim      = 6 + 384
         self.action_dim     = 3
 
+    def _compute_episode_weights(self):
+        ep_dominant = {}
+        for key, frames in self._episodes.items():
+            scenarios = [f["scenario"] for f in frames]
+            dominant  = Counter(scenarios).most_common(1)[0][0]
+            ep_dominant[key] = dominant
+
+        scenario_counts = Counter(ep_dominant.values())
+        print("[CarlaOfflineCotEnv] Episodes per scenario:", dict(scenario_counts))
+
+        total = sum(scenario_counts.values())
+        inv_freq = {s: total / c for s, c in scenario_counts.items()}
+
+        weights = np.array(
+            [inv_freq[ep_dominant[k]] for k in self._ep_keys],
+            dtype=np.float32
+        )
+        weights /= weights.sum()
+        return weights
+
     def reset(self):
-        ep_key = self._ep_keys[np.random.randint(len(self._ep_keys))]
+        ep_key = self._ep_keys[
+            np.random.choice(len(self._ep_keys), p=self._ep_weights)
+        ]
         self._current_ep  = self._episodes[ep_key]
         self._frame_idx   = 0
         self._ep_step     = 0
@@ -51,7 +89,8 @@ class CarlaOfflineCotEnv:
         reward = self._compute_reward(frame, action, gt_action)
         self._frame_idx  += 1
         self._ep_step    += 1
-        self._prev_action = np.array(action, dtype=np.float32)
+       
+        self._prev_action = np.clip(np.array(action, dtype=np.float32), ACTION_LOW, ACTION_HIGH)
         done = (self._frame_idx >= len(self._current_ep) or
                 self._ep_step  >= self.max_ep_len)
         if done:
@@ -63,6 +102,7 @@ class CarlaOfflineCotEnv:
             "vru_risk":  1.0 if frame["scenario"] in ("hard_brake", "near_stop") else 0.0,
             "progress":  1.0 - (self._frame_idx / len(self._current_ep)),
             "red_light": frame.get("red_light", 0),
+            "gt_action": gt_action,
         }
         return next_obs, reward, done, info
 
@@ -84,12 +124,19 @@ class CarlaOfflineCotEnv:
         return np.concatenate([driving_state, cot_vec])
 
     def _compute_reward(self, frame, pred_action, gt_action):
-        pred = np.array(pred_action, dtype=np.float32)
-        gt   = np.array(gt_action,   dtype=np.float32)
-        action_match = -np.mean((pred - gt) ** 2)
-        red_penalty  = W_RED_LIGHT if (frame.get("red_light", 0) == 1 and pred[1] > 0.3) else 0.0
+        
+        pred = np.clip(np.array(pred_action, dtype=np.float32), ACTION_LOW, ACTION_HIGH)
+        gt   = np.array(gt_action, dtype=np.float32)
+
+        action_match   = -np.mean((pred - gt) ** 2)
+        red_penalty    = W_RED_LIGHT if (frame.get("red_light", 0) == 1 and pred[1] > 0.3) else 0.0
         smooth_penalty = W_SMOOTH * np.sum(np.abs(pred - self._prev_action))
-        return float(W_PROGRESS * action_match + red_penalty + smooth_penalty)
+
+        scenario = frame.get("scenario", "")
+        correct  = float(np.mean((pred - gt) ** 2) < 0.05)
+        rare_bonus = SCENARIO_BONUS.get(scenario, 0.0) * correct
+
+        return float(W_PROGRESS * action_match + red_penalty + smooth_penalty + rare_bonus)
 
     def _load_episodes(self):
         episodes = defaultdict(list)

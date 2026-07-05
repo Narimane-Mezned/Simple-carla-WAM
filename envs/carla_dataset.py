@@ -1,13 +1,3 @@
-"""
-CONFIRMED dataset structure (from manifest.jsonl):
-  Each line contains:
-    episode_index, source_run, frame_index, image_path,
-    steering, throttle, brake, speed_ratio,
-    red_light, near_stop, instruction, done
-
-Observation : RGB image (64x64x3) uint8
-Action      : [steering, throttle, brake] float32
-"""
 
 import os
 import json
@@ -44,7 +34,7 @@ class CARLADatasetEnv:
         self.obs_space  = {"image": (image_size, image_size, 3)}
         self.act_space  = {"action": np.zeros(3, dtype=np.float32)}
 
-    # ── Public API ───────────────────────────────────────────────────
+    
 
     def reset(self):
         ep_name = np.random.choice(self.episode_names)
@@ -93,7 +83,7 @@ class CARLADatasetEnv:
 
         return obs, reward, self.done, info
 
-    # ── Private helpers ──────────────────────────────────────────────
+   
 
     def _get_obs(self, idx):
         frame = self.current_episode[idx]
@@ -124,7 +114,7 @@ class CARLADatasetEnv:
         return episodes
 
 
-# ── Quick test ───────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import sys
     DATASET_ROOT  = sys.argv[1] if len(sys.argv) > 1 else "./dataset"
